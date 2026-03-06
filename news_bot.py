@@ -2,11 +2,13 @@ import os
 import re
 import html
 from datetime import datetime, timedelta, timezone
+from collections import OrderedDict
 
 import feedparser
 import pandas as pd
 import requests
 from dateutil import parser as date_parser
+
 
 KST = timezone(timedelta(hours=9))
 
@@ -86,6 +88,37 @@ def contains_block(text: str, keywords: list[str]) -> bool:
     return any(k.lower() in lowered for k in keywords)
 
 
+def strip_source_from_title(title: str, source: str) -> str:
+    if not title:
+        return ""
+
+    title_clean = title.strip()
+    source_clean = (source or "").strip()
+
+    if not source_clean:
+        return title_clean
+
+    patterns = [
+        f" - {source_clean}",
+        f" | {source_clean}",
+        f" / {source_clean}",
+    ]
+
+    for pattern in patterns:
+        if title_clean.endswith(pattern):
+            return title_clean[:-len(pattern)].strip()
+
+    # 제목 안에 source가 마지막 토큰처럼 반복되는 경우도 정리
+    title_clean = re.sub(
+        rf"(\s*[-|/]\s*)?{re.escape(source_clean)}$",
+        "",
+        title_clean,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    return title_clean
+
+
 def row_to_config(row: pd.Series) -> dict:
     return {
         "org_name": clean_text(row.get("조직명", "")),
@@ -105,12 +138,12 @@ def fetch_news_for_config(config: dict) -> list[dict]:
     results = []
 
     for entry in feed.entries:
-        title = clean_text(entry.get("title", ""))
+        raw_title = clean_text(entry.get("title", ""))
         summary = clean_text(entry.get("summary", ""))
         link = clean_text(entry.get("link", ""))
         published_at = parse_datetime(entry)
 
-        if not title or not link:
+        if not raw_title or not link:
             continue
 
         if published_at and published_at < cutoff:
@@ -121,6 +154,7 @@ def fetch_news_for_config(config: dict) -> list[dict]:
         if isinstance(source_obj, dict):
             source = clean_text(source_obj.get("title", ""))
 
+        title = strip_source_from_title(raw_title, source)
         full_text = f"{title} {summary} {source}"
 
         if config["must_all"] and not contains_all(full_text, config["must_all"]):
@@ -150,49 +184,115 @@ def fetch_news_for_config(config: dict) -> list[dict]:
     return results
 
 
-def build_message(items: list[dict]) -> str:
+def deduplicate_items(items: list[dict]) -> list[dict]:
+    seen = set()
+    deduped = []
+
+    for item in items:
+        key = (item["org_name"], item["link"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    return deduped
+
+
+def build_fallback_text(items: list[dict]) -> str:
     today = datetime.now(KST).strftime("%Y-%m-%d")
-    lines = [
-        "[일일 조직 뉴스 알림]",
-        f"기준일: {today}",
-        ""
-    ]
+    if not items:
+        return f"[일일 조직 뉴스 알림] {today} / 조건에 맞는 뉴스가 없습니다."
+
+    parts = [f"[일일 조직 뉴스 알림] {today}"]
+    for item in items[: min(len(items), 5)]:
+        parts.append(f"[{item['org_name']}] {item['title']}")
+    return " / ".join(parts)
+
+
+def make_header_block(text: str, style: str = "blue") -> dict:
+    return {
+        "type": "header",
+        "text": text[:20],  # 카카오워크 헤더 최대 20자
+        "style": style,
+    }
+
+
+def make_text_block(text: str, inlines: list[dict] | None = None) -> dict:
+    block = {
+        "type": "text",
+        "text": text,
+    }
+    if inlines:
+        block["inlines"] = inlines
+    return block
+
+
+def build_blocks(items: list[dict]) -> list[dict]:
+    blocks = []
+
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    blocks.append(make_header_block("일일 조직 뉴스", "blue"))
+    blocks.append(make_text_block(f"기준일: {today}"))
 
     if not items:
-        lines.append("조건에 맞는 뉴스가 없습니다.")
-        return "\n".join(lines)
+        blocks.append(make_text_block("조건에 맞는 뉴스가 없습니다."))
+        return blocks
 
-    grouped = {}
+    grouped = OrderedDict()
     for item in items[:MAX_TOTAL_ARTICLES]:
         grouped.setdefault(item["org_name"], []).append(item)
-
-    count = 0
 
     for org_name, org_items in grouped.items():
         first = org_items[0]
         type_text = f" ({first['type']})" if first["type"] else ""
-        lines.append(f"■ {org_name}{type_text}")
+        header_text = f"{org_name}{type_text}"
+        blocks.append(make_header_block(header_text, "white"))
 
         for item in org_items:
-            source_text = f" / {item['source']}" if item["source"] else ""
-            time_text = f" / {item['published_at'].strftime('%m-%d %H:%M')}" if item["published_at"] else ""
-            lines.append(f"- {item['title']}{source_text}{time_text}")
-            lines.append(f"  {item['link']}")
-            count += 1
+            meta_parts = []
+            if item["source"]:
+                meta_parts.append(item["source"])
+            if item["published_at"]:
+                meta_parts.append(item["published_at"].strftime("%m-%d %H:%M"))
+            meta_text = " / ".join(meta_parts)
 
-        # 조직 간 구분용 빈 줄
-        lines.append("")
+            article_text = item["title"]
+            inlines = [
+                {
+                    "type": "link",
+                    "text": item["title"],
+                    "url": item["link"],
+                }
+            ]
 
-    lines.append(f"총 {count}건")
-    return "\n".join(lines)
+            if meta_text:
+                article_text += f"\n{meta_text}"
+
+            blocks.append(make_text_block(article_text, inlines))
+
+        # 조직 간 빈 줄
+        blocks.append(make_text_block(" "))
+
+    total_count = min(len(items), MAX_TOTAL_ARTICLES)
+    blocks.append(make_text_block(f"총 {total_count}건"))
+
+    return blocks
 
 
-def send_to_kakaowork(text: str) -> None:
+def send_to_kakaowork(items: list[dict]) -> None:
     if not KAKAOWORK_WEBHOOK_URL:
         raise ValueError("KAKAOWORK_WEBHOOK_URL 환경변수가 비어 있습니다.")
 
-    payload = {"text": text}
-    response = requests.post(KAKAOWORK_WEBHOOK_URL, json=payload, timeout=20)
+    payload = {
+        "text": build_fallback_text(items),
+        "blocks": build_blocks(items),
+    }
+
+    response = requests.post(
+        KAKAOWORK_WEBHOOK_URL,
+        json=payload,
+        timeout=20,
+    )
     response.raise_for_status()
 
 
@@ -219,13 +319,14 @@ def main():
         except Exception as e:
             print(f"[WARN] {config['org_name']}: {e}")
 
+    all_items = deduplicate_items(all_items)
+
     all_items.sort(
         key=lambda x: x["published_at"] or datetime(1970, 1, 1, tzinfo=KST),
         reverse=True,
     )
 
-    message = build_message(all_items)
-    send_to_kakaowork(message)
+    send_to_kakaowork(all_items)
     print("카카오워크 전송 완료")
 
 
