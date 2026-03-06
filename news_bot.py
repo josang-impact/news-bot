@@ -149,6 +149,25 @@ def normalize_title_for_dedup(title: str) -> str:
     return title
 
 
+def get_org_emoji(org_type: str) -> str:
+    org_type = clean_text(org_type)
+
+    if "재단" in org_type:
+        return "🌱"
+    if "협동조합" in org_type:
+        return "🤝"
+    if "병원" in org_type:
+        return "🏥"
+    if "학교" in org_type:
+        return "🎓"
+    if "기업" in org_type or "org" in org_type.lower():
+        return "🏢"
+    if "person" in org_type.lower() or "pers" in org_type.lower() or "인물" in org_type:
+        return "👤"
+
+    return "📰"
+
+
 def row_to_config(row: pd.Series) -> dict:
     return {
         "org_name": clean_text(row.get("조직명", "")),
@@ -277,49 +296,41 @@ def deduplicate_items(items: list[dict]) -> list[dict]:
     return deduped
 
 
-def build_message(items: list[dict], start_dt: datetime, end_dt: datetime) -> str:
-    today = datetime.now(KST).strftime("%Y-%m-%d")
+def build_message_for_org(org_name: str, org_items: list[dict], start_dt: datetime, end_dt: datetime) -> str:
+    first = org_items[0]
+    type_text = f" ({first['type']})" if first["type"] else ""
+    emoji = get_org_emoji(first["type"])
+
     lines = [
-        "[일일 조직 뉴스 알림]",
-        f"발송일: {today}",
-        f"수집구간: {start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')}",
+        f"{emoji} {org_name}{type_text}",
         "",
     ]
 
-    if not items:
-        lines.append("조건에 맞는 뉴스가 없습니다.")
-        return "\n".join(lines)
-
-    grouped = {}
-    for item in items[:MAX_TOTAL_ARTICLES]:
-        grouped.setdefault(item["org_name"], []).append(item)
-
     count = 0
 
-    for org_name, org_items in grouped.items():
-        first = org_items[0]
-        type_text = f" ({first['type']})" if first["type"] else ""
-        lines.append(f"■ {org_name}{type_text}")
+    for item in org_items:
+        meta_parts = []
 
-        for item in org_items:
-            meta_parts = []
-            if item["source"]:
-                meta_parts.append(item["source"])
-            if item["published_at"]:
-                meta_parts.append(item["published_at"].strftime("%m-%d %H:%M"))
-            meta_text = " / ".join(meta_parts)
+        if item["source"]:
+            meta_parts.append(item["source"])
 
-            if meta_text:
-                lines.append(f"- {item['title']} ({meta_text})")
-            else:
-                lines.append(f"- {item['title']}")
+        if item["published_at"]:
+            meta_parts.append(item["published_at"].strftime("%m-%d %H:%M"))
 
-            lines.append(f"  {item['link']}")
-            count += 1
+        meta_text = " / ".join(meta_parts)
 
+        lines.append(f"- {item['title']}")
+
+        if meta_text:
+            lines.append(f"  ({meta_text})")
+
+        lines.append(f"  {item['link']}")
         lines.append("")
 
+        count += 1
+
     lines.append(f"총 {count}건")
+
     return "\n".join(lines)
 
 
@@ -356,6 +367,9 @@ def main():
         return
 
     start_dt, end_dt = get_delivery_window(now_kst)
+    if start_dt is None or end_dt is None:
+        print("발송 구간을 계산할 수 없습니다.")
+        return
 
     df = load_sheet()
 
@@ -385,9 +399,18 @@ def main():
         reverse=True,
     )
 
-    message = build_message(all_items, start_dt, end_dt)
-    send_to_kakaowork(message)
-    print("카카오워크 전송 완료")
+    grouped = {}
+    for item in all_items[:MAX_TOTAL_ARTICLES]:
+        grouped.setdefault(item["org_name"], []).append(item)
+
+    if not grouped:
+        print("조건에 맞는 뉴스가 없습니다.")
+        return
+
+    for org_name, org_items in grouped.items():
+        message = build_message_for_org(org_name, org_items, start_dt, end_dt)
+        send_to_kakaowork(message)
+        print(f"{org_name} 전송 완료")
 
 
 if __name__ == "__main__":
