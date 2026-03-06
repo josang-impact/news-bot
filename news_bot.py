@@ -162,22 +162,27 @@ def build_message(items: list[dict]) -> str:
         lines.append("조건에 맞는 뉴스가 없습니다.")
         return "\n".join(lines)
 
-    current_org = None
+    grouped = {}
+    for item in items[:MAX_TOTAL_ARTICLES]:
+        grouped.setdefault(item["org_name"], []).append(item)
+
     count = 0
 
-    for item in items[:MAX_TOTAL_ARTICLES]:
-        if item["org_name"] != current_org:
-            current_org = item["org_name"]
-            type_text = f" ({item['type']})" if item["type"] else ""
-            lines.append(f"■ {current_org}{type_text}")
+    for org_name, org_items in grouped.items():
+        first = org_items[0]
+        type_text = f" ({first['type']})" if first["type"] else ""
+        lines.append(f"■ {org_name}{type_text}")
 
-        source_text = f" / {item['source']}" if item["source"] else ""
-        time_text = f" / {item['published_at'].strftime('%m-%d %H:%M')}" if item["published_at"] else ""
-        lines.append(f"- {item['title']}{source_text}{time_text}")
-        lines.append(f"  {item['link']}")
-        count += 1
+        for item in org_items:
+            source_text = f" / {item['source']}" if item["source"] else ""
+            time_text = f" / {item['published_at'].strftime('%m-%d %H:%M')}" if item["published_at"] else ""
+            lines.append(f"- {item['title']}{source_text}{time_text}")
+            lines.append(f"  {item['link']}")
+            count += 1
 
-    lines.append("")
+        # 조직 간 구분용 빈 줄
+        lines.append("")
+
     lines.append(f"총 {count}건")
     return "\n".join(lines)
 
