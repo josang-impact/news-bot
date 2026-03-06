@@ -2,12 +2,10 @@ import os
 import re
 import html
 from datetime import datetime, timedelta, timezone
-from collections import OrderedDict
+from email.utils import parsedate_to_datetime
 
-import feedparser
 import pandas as pd
 import requests
-from dateutil import parser as date_parser
 
 
 KST = timezone(timedelta(hours=9))
@@ -16,9 +14,14 @@ KAKAOWORK_WEBHOOK_URL = os.getenv("KAKAOWORK_WEBHOOK_URL", "").strip()
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 SHEET_GID = os.getenv("SHEET_GID", "0").strip()
 
+NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "").strip()
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "").strip()
+
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "3"))
 MAX_ARTICLES_PER_ORG = int(os.getenv("MAX_ARTICLES_PER_ORG", "2"))
 MAX_TOTAL_ARTICLES = int(os.getenv("MAX_TOTAL_ARTICLES", "20"))
+
+NAVER_NEWS_API_URL = "https://openapi.naver.com/v1/search/news.json"
 
 
 def build_google_sheet_csv_url(sheet_id: str, gid: str) -> str:
@@ -34,6 +37,7 @@ def load_sheet() -> pd.DataFrame:
 
 def clean_text(text: str) -> str:
     text = html.unescape(str(text or ""))
+    text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -44,24 +48,16 @@ def split_keywords(value: str) -> list[str]:
     return [x.strip() for x in str(value).split(",") if x.strip()]
 
 
-def parse_datetime(entry) -> datetime | None:
-    for key in ["published", "updated"]:
-        value = entry.get(key)
-        if not value:
-            continue
-        try:
-            dt = date_parser.parse(value)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(KST)
-        except Exception:
-            continue
-    return None
-
-
-def make_google_news_rss_url(query: str) -> str:
-    encoded = requests.utils.quote(query)
-    return f"https://news.google.com/rss/search?q={encoded}&hl=ko&gl=KR&ceid=KR:ko"
+def parse_naver_pubdate(value: str):
+    if not value:
+        return None
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(KST)
+    except Exception:
+        return None
 
 
 def normalize_query(raw_query: str, org_name: str) -> str:
@@ -108,7 +104,6 @@ def strip_source_from_title(title: str, source: str) -> str:
         if title_clean.endswith(pattern):
             return title_clean[:-len(pattern)].strip()
 
-    # 제목 안에 source가 마지막 토큰처럼 반복되는 경우도 정리
     title_clean = re.sub(
         rf"(\s*[-|/]\s*)?{re.escape(source_clean)}$",
         "",
@@ -131,31 +126,64 @@ def row_to_config(row: pd.Series) -> dict:
     }
 
 
-def fetch_news_for_config(config: dict) -> list[dict]:
-    feed = feedparser.parse(make_google_news_rss_url(config["query"]))
-    cutoff = datetime.now(KST) - timedelta(days=LOOKBACK_DAYS)
+def search_naver_news(query: str, display: int = 10, start: int = 1, sort: str = "date") -> dict:
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        raise ValueError("NAVER_CLIENT_ID 또는 NAVER_CLIENT_SECRET 환경변수가 비어 있습니다.")
 
+    headers = {
+        "X-Naver-Client-Id": NAVER_CLIENT_ID,
+        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+    }
+    params = {
+        "query": query,
+        "display": display,
+        "start": start,
+        "sort": sort,
+    }
+
+    response = requests.get(
+        NAVER_NEWS_API_URL,
+        headers=headers,
+        params=params,
+        timeout=20,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_news_for_config(config: dict) -> list[dict]:
+    # 조직별 최대 기사 수보다 좀 넉넉하게 받아서 필터링
+    raw = search_naver_news(
+        query=config["query"],
+        display=min(20, max(10, MAX_ARTICLES_PER_ORG * 5)),
+        start=1,
+        sort="date",
+    )
+
+    cutoff = datetime.now(KST) - timedelta(days=LOOKBACK_DAYS)
     results = []
 
-    for entry in feed.entries:
-        raw_title = clean_text(entry.get("title", ""))
-        summary = clean_text(entry.get("summary", ""))
-        link = clean_text(entry.get("link", ""))
-        published_at = parse_datetime(entry)
+    for item in raw.get("items", []):
+        title = clean_text(item.get("title", ""))
+        summary = clean_text(item.get("description", ""))
+        source = clean_text(item.get("originallink", ""))  # source 아님, 일단 비워두고 아래에서 재지정
+        pub_date = parse_naver_pubdate(item.get("pubDate", ""))
 
-        if not raw_title or not link:
+        if pub_date and pub_date < cutoff:
             continue
 
-        if published_at and published_at < cutoff:
+        originallink = clean_text(item.get("originallink", ""))
+        link = originallink or clean_text(item.get("link", ""))
+
+        if not title or not link:
             continue
 
-        source = ""
-        source_obj = entry.get("source")
-        if isinstance(source_obj, dict):
-            source = clean_text(source_obj.get("title", ""))
+        # title에 매체명이 붙는 경우가 있어 description 기반 필터 전에 정리
+        # 네이버 API 자체에 source 필드가 없어서 link 도메인으로 매체명 비슷하게 표시
+        source_name = extract_source_name(link)
+        title = strip_source_from_title(title, source_name)
 
-        title = strip_source_from_title(raw_title, source)
-        full_text = f"{title} {summary} {source}"
+        full_text = f"{title} {summary} {source_name}"
 
         if config["must_all"] and not contains_all(full_text, config["must_all"]):
             continue
@@ -166,22 +194,35 @@ def fetch_news_for_config(config: dict) -> list[dict]:
         if config["block"] and contains_block(full_text, config["block"]):
             continue
 
-        results.append({
-            "org_name": config["org_name"],
-            "type": config["type"],
-            "title": title,
-            "summary": summary,
-            "link": link,
-            "source": source,
-            "published_at": published_at,
-            "query": config["query"],
-            "seq": config["seq"],
-        })
+        results.append(
+            {
+                "org_name": config["org_name"],
+                "type": config["type"],
+                "title": title,
+                "summary": summary,
+                "link": link,
+                "source": source_name,
+                "published_at": pub_date,
+                "query": config["query"],
+                "seq": config["seq"],
+            }
+        )
 
         if len(results) >= MAX_ARTICLES_PER_ORG:
             break
 
     return results
+
+
+def extract_source_name(url: str) -> str:
+    if not url:
+        return ""
+    m = re.search(r"https?://(?:www\.)?([^/]+)", url)
+    if not m:
+        return ""
+    domain = m.group(1).lower()
+    domain = domain.replace("www.", "")
+    return domain
 
 
 def deduplicate_items(items: list[dict]) -> list[dict]:
@@ -198,55 +239,28 @@ def deduplicate_items(items: list[dict]) -> list[dict]:
     return deduped
 
 
-def build_fallback_text(items: list[dict]) -> str:
+def build_message(items: list[dict]) -> str:
     today = datetime.now(KST).strftime("%Y-%m-%d")
-    if not items:
-        return f"[일일 조직 뉴스 알림] {today} / 조건에 맞는 뉴스가 없습니다."
-
-    parts = [f"[일일 조직 뉴스 알림] {today}"]
-    for item in items[: min(len(items), 5)]:
-        parts.append(f"[{item['org_name']}] {item['title']}")
-    return " / ".join(parts)
-
-
-def make_header_block(text: str, style: str = "blue") -> dict:
-    return {
-        "type": "header",
-        "text": text[:20],  # 카카오워크 헤더 최대 20자
-        "style": style,
-    }
-
-
-def make_text_block(text: str, inlines: list[dict] | None = None) -> dict:
-    block = {
-        "type": "text",
-        "text": text,
-    }
-    if inlines:
-        block["inlines"] = inlines
-    return block
-
-
-def build_blocks(items: list[dict]) -> list[dict]:
-    blocks = []
-
-    today = datetime.now(KST).strftime("%Y-%m-%d")
-    blocks.append(make_header_block("일일 조직 뉴스", "blue"))
-    blocks.append(make_text_block(f"기준일: {today}"))
+    lines = [
+        "[일일 조직 뉴스 알림]",
+        f"기준일: {today}",
+        "",
+    ]
 
     if not items:
-        blocks.append(make_text_block("조건에 맞는 뉴스가 없습니다."))
-        return blocks
+        lines.append("조건에 맞는 뉴스가 없습니다.")
+        return "\n".join(lines)
 
-    grouped = OrderedDict()
+    grouped = {}
     for item in items[:MAX_TOTAL_ARTICLES]:
         grouped.setdefault(item["org_name"], []).append(item)
+
+    count = 0
 
     for org_name, org_items in grouped.items():
         first = org_items[0]
         type_text = f" ({first['type']})" if first["type"] else ""
-        header_text = f"{org_name}{type_text}"
-        blocks.append(make_header_block(header_text, "white"))
+        lines.append(f"■ {org_name}{type_text}")
 
         for item in org_items:
             meta_parts = []
@@ -256,37 +270,25 @@ def build_blocks(items: list[dict]) -> list[dict]:
                 meta_parts.append(item["published_at"].strftime("%m-%d %H:%M"))
             meta_text = " / ".join(meta_parts)
 
-            article_text = item["title"]
-            inlines = [
-                {
-                    "type": "link",
-                    "text": item["title"],
-                    "url": item["link"],
-                }
-            ]
-
             if meta_text:
-                article_text += f"\n{meta_text}"
+                lines.append(f"- {item['title']} ({meta_text})")
+            else:
+                lines.append(f"- {item['title']}")
 
-            blocks.append(make_text_block(article_text, inlines))
+            lines.append(f"  {item['link']}")
+            count += 1
 
-        # 조직 간 빈 줄
-        blocks.append(make_text_block(" "))
+        lines.append("")
 
-    total_count = min(len(items), MAX_TOTAL_ARTICLES)
-    blocks.append(make_text_block(f"총 {total_count}건"))
-
-    return blocks
+    lines.append(f"총 {count}건")
+    return "\n".join(lines)
 
 
-def send_to_kakaowork(items: list[dict]) -> None:
+def send_to_kakaowork(text: str) -> None:
     if not KAKAOWORK_WEBHOOK_URL:
         raise ValueError("KAKAOWORK_WEBHOOK_URL 환경변수가 비어 있습니다.")
 
-    payload = {
-        "text": build_fallback_text(items),
-        "blocks": build_blocks(items),
-    }
+    payload = {"text": text}
 
     response = requests.post(
         KAKAOWORK_WEBHOOK_URL,
@@ -297,6 +299,16 @@ def send_to_kakaowork(items: list[dict]) -> None:
 
 
 def main():
+    required_envs = {
+        "KAKAOWORK_WEBHOOK_URL": KAKAOWORK_WEBHOOK_URL,
+        "SHEET_ID": SHEET_ID,
+        "NAVER_CLIENT_ID": NAVER_CLIENT_ID,
+        "NAVER_CLIENT_SECRET": NAVER_CLIENT_SECRET,
+    }
+    missing = [k for k, v in required_envs.items() if not v]
+    if missing:
+        raise ValueError(f"필수 환경변수가 비어 있습니다: {', '.join(missing)}")
+
     df = load_sheet()
 
     required_columns = ["조직명", "검색어"]
@@ -320,13 +332,13 @@ def main():
             print(f"[WARN] {config['org_name']}: {e}")
 
     all_items = deduplicate_items(all_items)
-
     all_items.sort(
         key=lambda x: x["published_at"] or datetime(1970, 1, 1, tzinfo=KST),
         reverse=True,
     )
 
-    send_to_kakaowork(all_items)
+    message = build_message(all_items)
+    send_to_kakaowork(message)
     print("카카오워크 전송 완료")
 
 
