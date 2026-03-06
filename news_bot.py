@@ -17,7 +17,6 @@ SHEET_GID = os.getenv("SHEET_GID", "0").strip()
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "").strip()
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "").strip()
 
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "3"))
 MAX_ARTICLES_PER_ORG = int(os.getenv("MAX_ARTICLES_PER_ORG", "2"))
 MAX_TOTAL_ARTICLES = int(os.getenv("MAX_TOTAL_ARTICLES", "20"))
 
@@ -58,6 +57,33 @@ def parse_naver_pubdate(value: str):
         return dt.astimezone(KST)
     except Exception:
         return None
+
+
+def get_delivery_window(now_kst: datetime | None = None) -> tuple[datetime | None, datetime | None]:
+    """
+    발송 시점 기준 기사 수집 구간
+
+    - 월요일: 직전 금요일 08:00:00 ~ 월요일 07:59:59
+    - 화~금: 전날 08:00:00 ~ 당일 07:59:59
+    - 토/일: 발송 안 함
+    """
+    if now_kst is None:
+        now_kst = datetime.now(KST)
+
+    weekday = now_kst.weekday()  # 월=0, 화=1, ..., 토=5, 일=6
+
+    if weekday >= 5:
+        return None, None
+
+    end_dt = now_kst.replace(hour=7, minute=59, second=59, microsecond=0)
+
+    if weekday == 0:
+        start_base = now_kst - timedelta(days=3)  # 금요일
+    else:
+        start_base = now_kst - timedelta(days=1)
+
+    start_dt = start_base.replace(hour=8, minute=0, second=0, microsecond=0)
+    return start_dt, end_dt
 
 
 def normalize_query(raw_query: str, org_name: str) -> str:
@@ -114,6 +140,15 @@ def strip_source_from_title(title: str, source: str) -> str:
     return title_clean
 
 
+def normalize_title_for_dedup(title: str) -> str:
+    title = clean_text(title).lower()
+    title = re.sub(r"\[[^\]]+\]", "", title)
+    title = re.sub(r"[\"'“”‘’]", "", title)
+    title = re.sub(r"[^0-9a-zA-Z가-힣\s]", " ", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    return title
+
+
 def row_to_config(row: pd.Series) -> dict:
     return {
         "org_name": clean_text(row.get("조직명", "")),
@@ -151,35 +186,40 @@ def search_naver_news(query: str, display: int = 10, start: int = 1, sort: str =
     return response.json()
 
 
-def fetch_news_for_config(config: dict) -> list[dict]:
-    # 조직별 최대 기사 수보다 좀 넉넉하게 받아서 필터링
+def extract_source_name(url: str) -> str:
+    if not url:
+        return ""
+    m = re.search(r"https?://(?:www\.)?([^/]+)", url)
+    if not m:
+        return ""
+    domain = m.group(1).lower().replace("www.", "")
+    return domain
+
+
+def fetch_news_for_config(config: dict, start_dt: datetime, end_dt: datetime) -> list[dict]:
     raw = search_naver_news(
         query=config["query"],
-        display=min(20, max(10, MAX_ARTICLES_PER_ORG * 5)),
+        display=min(50, max(20, MAX_ARTICLES_PER_ORG * 10)),
         start=1,
         sort="date",
     )
 
-    cutoff = datetime.now(KST) - timedelta(days=LOOKBACK_DAYS)
     results = []
 
     for item in raw.get("items", []):
         title = clean_text(item.get("title", ""))
         summary = clean_text(item.get("description", ""))
-        source = clean_text(item.get("originallink", ""))  # source 아님, 일단 비워두고 아래에서 재지정
         pub_date = parse_naver_pubdate(item.get("pubDate", ""))
-
-        if pub_date and pub_date < cutoff:
-            continue
 
         originallink = clean_text(item.get("originallink", ""))
         link = originallink or clean_text(item.get("link", ""))
 
-        if not title or not link:
+        if not title or not link or not pub_date:
             continue
 
-        # title에 매체명이 붙는 경우가 있어 description 기반 필터 전에 정리
-        # 네이버 API 자체에 source 필드가 없어서 link 도메인으로 매체명 비슷하게 표시
+        if not (start_dt <= pub_date <= end_dt):
+            continue
+
         source_name = extract_source_name(link)
         title = strip_source_from_title(title, source_name)
 
@@ -214,36 +254,35 @@ def fetch_news_for_config(config: dict) -> list[dict]:
     return results
 
 
-def extract_source_name(url: str) -> str:
-    if not url:
-        return ""
-    m = re.search(r"https?://(?:www\.)?([^/]+)", url)
-    if not m:
-        return ""
-    domain = m.group(1).lower()
-    domain = domain.replace("www.", "")
-    return domain
-
-
 def deduplicate_items(items: list[dict]) -> list[dict]:
-    seen = set()
+    seen_links = set()
+    seen_titles = set()
     deduped = []
 
     for item in items:
-        key = (item["org_name"], item["link"])
-        if key in seen:
+        org_name = item["org_name"]
+        link_key = (org_name, item["link"].strip())
+        title_key = (org_name, normalize_title_for_dedup(item["title"]))
+
+        if link_key in seen_links:
             continue
-        seen.add(key)
+
+        if title_key in seen_titles:
+            continue
+
+        seen_links.add(link_key)
+        seen_titles.add(title_key)
         deduped.append(item)
 
     return deduped
 
 
-def build_message(items: list[dict]) -> str:
+def build_message(items: list[dict], start_dt: datetime, end_dt: datetime) -> str:
     today = datetime.now(KST).strftime("%Y-%m-%d")
     lines = [
         "[일일 조직 뉴스 알림]",
-        f"기준일: {today}",
+        f"발송일: {today}",
+        f"수집구간: {start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')}",
         "",
     ]
 
@@ -309,6 +348,15 @@ def main():
     if missing:
         raise ValueError(f"필수 환경변수가 비어 있습니다: {', '.join(missing)}")
 
+    now_kst = datetime.now(KST)
+    weekday = now_kst.weekday()
+
+    if weekday >= 5:
+        print("주말이므로 발송하지 않습니다.")
+        return
+
+    start_dt, end_dt = get_delivery_window(now_kst)
+
     df = load_sheet()
 
     required_columns = ["조직명", "검색어"]
@@ -326,7 +374,7 @@ def main():
 
     for config in configs:
         try:
-            items = fetch_news_for_config(config)
+            items = fetch_news_for_config(config, start_dt, end_dt)
             all_items.extend(items)
         except Exception as e:
             print(f"[WARN] {config['org_name']}: {e}")
@@ -337,7 +385,7 @@ def main():
         reverse=True,
     )
 
-    message = build_message(all_items)
+    message = build_message(all_items, start_dt, end_dt)
     send_to_kakaowork(message)
     print("카카오워크 전송 완료")
 
