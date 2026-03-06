@@ -29,4 +29,6 @@ jobs:
           LOOKBACK_DAYS: ${{ secrets.LOOKBACK_DAYS }}
           MAX_ARTICLES_PER_ORG: ${{ secrets.MAX_ARTICLES_PER_ORG }}
           MAX_TOTAL_ARTICLES: ${{ secrets.MAX_TOTAL_ARTICLES }}
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
         run: python news_bot.py
