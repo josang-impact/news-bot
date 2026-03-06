@@ -2,7 +2,7 @@ name: Daily Org News to KakaoWork
 
 on:
   schedule:
-    - cron: "0 23 * * *"
+    - cron: "0 23 * * 0-4"
   workflow_dispatch:
 
 jobs:
@@ -26,7 +26,6 @@ jobs:
           KAKAOWORK_WEBHOOK_URL: ${{ secrets.KAKAOWORK_WEBHOOK_URL }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           SHEET_GID: ${{ secrets.SHEET_GID }}
-          LOOKBACK_DAYS: ${{ secrets.LOOKBACK_DAYS }}
           MAX_ARTICLES_PER_ORG: ${{ secrets.MAX_ARTICLES_PER_ORG }}
           MAX_TOTAL_ARTICLES: ${{ secrets.MAX_TOTAL_ARTICLES }}
           NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
