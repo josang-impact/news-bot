@@ -33,6 +33,8 @@ SHEET_GID = os.getenv("SHEET_GID", "0").strip()
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "").strip()
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "").strip()
 
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "").strip()
+
 MAX_ARTICLES_PER_ORG = int(os.getenv("MAX_ARTICLES_PER_ORG", "3"))
 NAVER_DISPLAY = int(os.getenv("NAVER_DISPLAY", "20"))
 NAVER_PAGES = int(os.getenv("NAVER_PAGES", "5"))
@@ -61,6 +63,19 @@ def parse_pubdate(value):
         return None
 
 
+def parse_iso_datetime(value):
+    """ISO 8601 형식 문자열을 KST datetime으로 변환 (NewsAPI용)."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(KST)
+    except Exception:
+        return None
+
+
 def safe_str(value):
     """시트 셀 값을 안전하게 문자열로 변환 (NaN 처리)."""
     if pd.isna(value):
@@ -69,7 +84,7 @@ def safe_str(value):
 
 
 def parse_csv_list(value):
-    """쉼표로 구분된 문자열을 리스트로 변환. 빈 문자열이면 빈 리스트 반환."""
+    """쉼표로 구분된 문자열을 리스트로 변환."""
     s = safe_str(value)
     if not s:
         return []
@@ -93,29 +108,49 @@ def parse_keywords(query_str):
 # ──────────────────────────────────────────────
 # 필터링
 # ──────────────────────────────────────────────
-def relevance_pass(title, summary, must_all, must_any, block):
+def keyword_in_text(keywords, title, summary):
     """
-    시트의 MUST_ALL, MUST_ANY, BLOCK 컬럼을 활용한 필터링.
+    검색 키워드 중 최소 하나가 제목 또는 요약에 실제로 포함되어 있는지 확인.
+    네이버 API가 느슨하게 매칭하는 문제를 방지하는 1차 관련성 체크.
+    """
+    title_lower = title.lower()
+    summary_lower = summary.lower()
 
-    - BLOCK:    하나라도 포함되면 제외
-    - MUST_ALL: 모든 키워드가 포함되어야 통과
-    - MUST_ANY: 하나 이상 포함되어야 통과
-    - 세 컬럼 모두 비어 있으면 기본 통과
+    for kw in keywords:
+        kw_lower = kw.lower()
+        if kw_lower in title_lower or kw_lower in summary_lower:
+            return True
+
+    return False
+
+
+def relevance_pass(title, summary, keywords, must_all, must_any, block):
     """
+    필터링 파이프라인:
+
+    1) 키워드 존재 확인: 검색 키워드 중 최소 하나가 제목/요약에 포함
+    2) BLOCK:    하나라도 포함되면 제외
+    3) MUST_ALL: 모든 키워드가 포함되어야 통과
+    4) MUST_ANY: 하나 이상 포함되어야 통과
+    """
+    # 1) 검색 키워드가 제목/요약에 실제로 존재하는지 확인
+    if not keyword_in_text(keywords, title, summary):
+        return False
+
     text = (title + " " + summary).lower()
 
-    # BLOCK 체크
+    # 2) BLOCK 체크
     for b in block:
         if b.lower() in text:
             return False
 
-    # MUST_ALL 체크
+    # 3) MUST_ALL 체크
     if must_all:
         for m in must_all:
             if m.lower() not in text:
                 return False
 
-    # MUST_ANY 체크
+    # 4) MUST_ANY 체크
     if must_any:
         if not any(m.lower() in text for m in must_any):
             return False
@@ -145,7 +180,11 @@ def load_sheet():
 # 네이버 검색
 # ──────────────────────────────────────────────
 def search_naver(query):
-    """네이버 뉴스 검색 API를 호출하여 결과 리스트 반환."""
+    """네이버 뉴스 검색 API 호출. 결과 리스트 반환."""
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        logger.warning("네이버 API 키가 설정되지 않았습니다.")
+        return []
+
     headers = {
         "X-Naver-Client-Id": NAVER_CLIENT_ID,
         "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
@@ -201,19 +240,97 @@ def search_naver(query):
     return results
 
 
-def search_all_keywords(keywords):
+# ──────────────────────────────────────────────
+# NewsAPI.org 검색
+# ──────────────────────────────────────────────
+def search_newsapi(query, start_dt, end_dt):
     """
-    여러 키워드(or로 분리된)를 각각 검색하고 결과를 합침.
+    NewsAPI.org /v2/everything 엔드포인트로 검색.
+    NEWSAPI_KEY 환경변수가 없으면 빈 리스트 반환 (옵션 기능).
+
+    - query:    검색어 (OR 포함 전체 쿼리 가능)
+    - start_dt: 시작 시각 (KST datetime)
+    - end_dt:   종료 시각 (KST datetime)
+    """
+    if not NEWSAPI_KEY:
+        return []
+
+    from_utc = start_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    to_utc = end_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    params = {
+        "q": query,
+        "from": from_utc,
+        "to": to_utc,
+        "sortBy": "publishedAt",
+        "pageSize": 50,
+        "language": "ko",
+        "apiKey": NEWSAPI_KEY,
+    }
+
+    try:
+        r = requests.get(
+            "https://newsapi.org/v2/everything",
+            params=params,
+            timeout=20,
+        )
+        r.raise_for_status()
+    except requests.RequestException as e:
+        logger.warning(f"NewsAPI 검색 실패 (query={query}): {e}")
+        return []
+
+    articles = r.json().get("articles", [])
+    results = []
+
+    for a in articles:
+        title = clean_text(a.get("title"))
+        link = a.get("url")
+        pub_date = parse_iso_datetime(a.get("publishedAt"))
+        summary = clean_text(a.get("description") or a.get("content") or "")
+
+        if not title or not link:
+            continue
+
+        results.append(
+            {
+                "title": title,
+                "summary": summary,
+                "link": link,
+                "published_at": pub_date,
+            }
+        )
+
+    logger.info(f"NewsAPI 결과: {len(results)}건 (query={query})")
+    return results
+
+
+# ──────────────────────────────────────────────
+# 통합 검색
+# ──────────────────────────────────────────────
+def search_all_keywords(keywords, start_dt, end_dt):
+    """
+    여러 키워드(or로 분리된)를 각각 네이버에서 검색하고,
+    NewsAPI에는 OR 연결 전체 쿼리를 한 번 보낸 뒤 결과를 합침.
     링크 기준으로 중복 제거.
     """
     seen_links = set()
     results = []
 
+    def _add(item):
+        if item["link"] not in seen_links:
+            seen_links.add(item["link"])
+            results.append(item)
+
+    # 네이버: 키워드별 개별 검색 (OR 미지원)
     for kw in keywords:
         for item in search_naver(kw):
-            if item["link"] not in seen_links:
-                seen_links.add(item["link"])
-                results.append(item)
+            _add(item)
+
+    # NewsAPI: OR 연결 전체 쿼리 한 번 검색
+    if NEWSAPI_KEY and keywords:
+        newsapi_query = " OR ".join(f'"{kw}"' for kw in keywords)
+        for item in search_newsapi(newsapi_query, start_dt, end_dt):
+            _add(item)
 
     return results
 
@@ -287,6 +404,11 @@ def main():
 
     logger.info(f"발송 윈도우: {start_dt} ~ {end_dt}")
 
+    if NEWSAPI_KEY:
+        logger.info("NewsAPI.org 활성화됨")
+    else:
+        logger.info("NewsAPI.org 비활성화 (NEWSAPI_KEY 미설정)")
+
     df = load_sheet()
 
     # ── 1단계: 조직별로 행을 묶어서 검색 & 필터링 ──
@@ -304,12 +426,12 @@ def main():
         must_any = parse_csv_list(row.get("MUST_ANY"))
         block = parse_csv_list(row.get("BLOCK"))
 
-        # or로 구분된 키워드 전체 검색
+        # or로 구분된 키워드 전체 검색 (네이버 + NewsAPI)
         keywords = parse_keywords(query)
         if not keywords:
             continue
 
-        news = search_all_keywords(keywords)
+        news = search_all_keywords(keywords, start_dt, end_dt)
 
         for item in news:
             title = item["title"]
@@ -322,8 +444,8 @@ def main():
             if not (start_dt <= pub <= end_dt):
                 continue
 
-            # MUST_ALL / MUST_ANY / BLOCK 필터
-            if not relevance_pass(title, summary, must_all, must_any, block):
+            # 키워드 존재 + MUST_ALL / MUST_ANY / BLOCK 필터
+            if not relevance_pass(title, summary, keywords, must_all, must_any, block):
                 continue
 
             org_results[org].append(item)
