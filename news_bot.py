@@ -39,6 +39,9 @@ MAX_ARTICLES_PER_ORG = int(os.getenv("MAX_ARTICLES_PER_ORG", "3"))
 NAVER_DISPLAY = int(os.getenv("NAVER_DISPLAY", "20"))
 NAVER_PAGES = int(os.getenv("NAVER_PAGES", "5"))
 
+# 짧은/모호한 키워드 판단 기준 글자수 (이하이면 제목 필수 매칭)
+SHORT_KEYWORD_LEN = 3
+
 
 # ──────────────────────────────────────────────
 # 유틸리티
@@ -105,21 +108,45 @@ def parse_keywords(query_str):
     return keywords
 
 
+def is_short_keyword(kw):
+    """짧거나 모호한 키워드인지 판단. 한글 기준 3글자 이하, 영문 기준 5자 이하."""
+    kw = kw.strip()
+    # 한글이 포함되어 있으면 한글 기준
+    if re.search(r"[가-힣]", kw):
+        return len(kw) <= SHORT_KEYWORD_LEN
+    # 영문/숫자만이면 5자 이하 (MARC, Link 등)
+    return len(kw) <= 5
+
+
 # ──────────────────────────────────────────────
 # 필터링
 # ──────────────────────────────────────────────
-def keyword_in_text(keywords, title, summary):
+def keyword_match(keywords, title, summary):
     """
-    검색 키워드 중 최소 하나가 제목 또는 요약에 실제로 포함되어 있는지 확인.
-    네이버 API가 느슨하게 매칭하는 문제를 방지하는 1차 관련성 체크.
+    검색 키워드와 기사의 관련성을 확인.
+
+    - 긴 키워드(4글자+): 제목 또는 요약에 포함되면 통과
+    - 짧은 키워드(3글자-): 제목에 포함되어야 통과 (요약만으로는 불가)
+      → "무의", "카임", "MARC", "박수빈" 등이 description에만 우연히
+        포함되는 노이즈를 차단
+
+    단, 짧은 키워드라도 단독이 아니라 긴 키워드와 함께 있는 경우
+    (예: "무의" or "협동조합 무의") 긴 키워드가 요약에 매칭되면 통과.
     """
     title_lower = title.lower()
     summary_lower = summary.lower()
 
     for kw in keywords:
         kw_lower = kw.lower()
-        if kw_lower in title_lower or kw_lower in summary_lower:
-            return True
+
+        if is_short_keyword(kw):
+            # 짧은 키워드: 제목 매칭 필수
+            if kw_lower in title_lower:
+                return True
+        else:
+            # 긴 키워드: 제목 또는 요약 매칭
+            if kw_lower in title_lower or kw_lower in summary_lower:
+                return True
 
     return False
 
@@ -128,13 +155,13 @@ def relevance_pass(title, summary, keywords, must_all, must_any, block):
     """
     필터링 파이프라인:
 
-    1) 키워드 존재 확인: 검색 키워드 중 최소 하나가 제목/요약에 포함
+    1) 키워드 매칭: 짧은 키워드는 제목 필수, 긴 키워드는 제목/요약
     2) BLOCK:    하나라도 포함되면 제외
     3) MUST_ALL: 모든 키워드가 포함되어야 통과
     4) MUST_ANY: 하나 이상 포함되어야 통과
     """
-    # 1) 검색 키워드가 제목/요약에 실제로 존재하는지 확인
-    if not keyword_in_text(keywords, title, summary):
+    # 1) 키워드 매칭 (짧은 키워드 → 제목 필수)
+    if not keyword_match(keywords, title, summary):
         return False
 
     text = (title + " " + summary).lower()
@@ -247,10 +274,6 @@ def search_newsapi(query, start_dt, end_dt):
     """
     NewsAPI.org /v2/everything 엔드포인트로 검색.
     NEWSAPI_KEY 환경변수가 없으면 빈 리스트 반환 (옵션 기능).
-
-    - query:    검색어 (OR 포함 전체 쿼리 가능)
-    - start_dt: 시작 시각 (KST datetime)
-    - end_dt:   종료 시각 (KST datetime)
     """
     if not NEWSAPI_KEY:
         return []
@@ -444,7 +467,7 @@ def main():
             if not (start_dt <= pub <= end_dt):
                 continue
 
-            # 키워드 존재 + MUST_ALL / MUST_ANY / BLOCK 필터
+            # 키워드 매칭 + MUST_ALL / MUST_ANY / BLOCK 필터
             if not relevance_pass(title, summary, keywords, must_all, must_any, block):
                 continue
 
