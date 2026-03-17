@@ -42,6 +42,9 @@ NAVER_PAGES = int(os.getenv("NAVER_PAGES", "5"))
 # 제목에 반드시 포함되어야 하는 키워드 (항상 제목 필수, MUST 여부 무관)
 TITLE_ONLY_KEYWORDS = {"카카오", "김범수"}
 
+# 기사 수 제한 없는 조직 (MAX_ARTICLES_PER_ORG 무시)
+UNCAPPED_ORGS = {"카카오", "김범수", "브라이언임팩트", "카카오임팩트"}
+
 # 짧은 키워드 판단 기준 (한글 3글자 이하, 영문 5자 이하)
 # 짧은 키워드는 기본적으로 제목 필수이지만,
 # MUST_ALL 또는 MUST_ANY가 있으면 요약 매칭도 허용
@@ -516,7 +519,11 @@ def main():
             reverse=True,
         )
 
-        final = sorted_items[:MAX_ARTICLES_PER_ORG]
+        # 조직별 기사 수 제한 (UNCAPPED_ORGS는 무제한)
+        if org in UNCAPPED_ORGS:
+            final = sorted_items
+        else:
+            final = sorted_items[:MAX_ARTICLES_PER_ORG]
 
         if not final:
             continue
