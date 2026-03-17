@@ -39,9 +39,14 @@ MAX_ARTICLES_PER_ORG = int(os.getenv("MAX_ARTICLES_PER_ORG", "3"))
 NAVER_DISPLAY = int(os.getenv("NAVER_DISPLAY", "20"))
 NAVER_PAGES = int(os.getenv("NAVER_PAGES", "5"))
 
-# 짧은/모호한 키워드 판단 기준 글자수 (이하이면 제목 필수 매칭)
-# 제목에 반드시 포함되어야 하는 키워드 (노이즈가 심한 광범위 키워드)
+# 제목에 반드시 포함되어야 하는 키워드 (항상 제목 필수, MUST 여부 무관)
 TITLE_ONLY_KEYWORDS = {"카카오", "김범수"}
+
+# 짧은 키워드 판단 기준 (한글 3글자 이하, 영문 5자 이하)
+# 짧은 키워드는 기본적으로 제목 필수이지만,
+# MUST_ALL 또는 MUST_ANY가 있으면 요약 매칭도 허용
+SHORT_KW_KR = 3
+SHORT_KW_EN = 5
 
 
 # ──────────────────────────────────────────────
@@ -113,13 +118,30 @@ def parse_keywords(query_str):
 # ──────────────────────────────────────────────
 # 필터링
 # ──────────────────────────────────────────────
-def keyword_match(keywords, title, summary):
+def is_short_keyword(kw):
+    """짧은 키워드인지 판단. 한글 3글자 이하, 영문 5자 이하."""
+    kw = kw.strip()
+    if re.search(r"[가-힣]", kw):
+        return len(kw) <= SHORT_KW_KR
+    return len(kw) <= SHORT_KW_EN
+
+
+def keyword_match(keywords, title, summary, has_must_filter):
     """
     검색 키워드와 기사의 관련성을 확인.
 
-    - TITLE_ONLY_KEYWORDS에 해당하는 키워드: 제목에 포함되어야 통과
-      → "카카오", "김범수" 등 노이즈가 심한 광범위 키워드
-    - 그 외 모든 키워드: 제목 또는 요약에 포함되면 통과
+    매칭 규칙 (키워드별로 판단, 하나라도 매칭되면 통과):
+
+    1) TITLE_ONLY_KEYWORDS ("카카오", "김범수"):
+       → 항상 제목 필수. MUST 필터 유무와 무관.
+
+    2) 짧은 키워드 (한글 3글자-, 영문 5자-):
+       → MUST_ALL 또는 MUST_ANY 필터가 있으면: 제목 또는 요약
+       → 필터가 없으면: 제목 필수
+       (필터가 노이즈를 걸러주므로 요약 매칭 허용)
+
+    3) 긴 키워드 (한글 4글자+, 영문 6자+):
+       → 항상 제목 또는 요약
     """
     title_lower = title.lower()
     summary_lower = summary.lower()
@@ -127,14 +149,24 @@ def keyword_match(keywords, title, summary):
     for kw in keywords:
         kw_lower = kw.lower()
 
+        # 1) TITLE_ONLY: 항상 제목 필수
         if kw in TITLE_ONLY_KEYWORDS:
-            # 제목 필수 매칭
             if kw_lower in title_lower:
                 return True
-        else:
-            # 제목 또는 요약 매칭
-            if kw_lower in title_lower or kw_lower in summary_lower:
+            continue
+
+        # 2) 짧은 키워드
+        if is_short_keyword(kw):
+            if kw_lower in title_lower:
                 return True
+            # MUST 필터가 있으면 요약도 허용
+            if has_must_filter and kw_lower in summary_lower:
+                return True
+            continue
+
+        # 3) 긴 키워드: 제목 또는 요약
+        if kw_lower in title_lower or kw_lower in summary_lower:
+            return True
 
     return False
 
@@ -143,13 +175,19 @@ def relevance_pass(title, summary, keywords, must_all, must_any, block):
     """
     필터링 파이프라인:
 
-    1) 키워드 매칭: TITLE_ONLY 키워드는 제목 필수, 나머지는 제목/요약
+    1) 키워드 매칭:
+       - TITLE_ONLY 키워드 → 항상 제목 필수
+       - 짧은 키워드 + MUST 필터 없음 → 제목 필수
+       - 짧은 키워드 + MUST 필터 있음 → 제목/요약
+       - 긴 키워드 → 항상 제목/요약
     2) BLOCK:    하나라도 포함되면 제외
     3) MUST_ALL: 모든 키워드가 포함되어야 통과
     4) MUST_ANY: 하나 이상 포함되어야 통과
     """
-    # 1) 키워드 매칭 (짧은 키워드 → 제목 필수)
-    if not keyword_match(keywords, title, summary):
+    has_must_filter = bool(must_all or must_any)
+
+    # 1) 키워드 매칭
+    if not keyword_match(keywords, title, summary, has_must_filter):
         return False
 
     text = (title + " " + summary).lower()
