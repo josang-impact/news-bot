@@ -36,12 +36,13 @@ NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "").strip()
 
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "").strip()
 
-MAX_ARTICLES_PER_ORG = int(os.getenv("MAX_ARTICLES_PER_ORG", "3"))
-NAVER_DISPLAY = int(os.getenv("NAVER_DISPLAY", "20"))
-NAVER_PAGES = int(os.getenv("NAVER_PAGES", "5"))
+# 빈 문자열이 들어와도 기본값으로 동작하도록 `or` 처리
+MAX_ARTICLES_PER_ORG = int(os.getenv("MAX_ARTICLES_PER_ORG") or 3)
+NAVER_DISPLAY = int(os.getenv("NAVER_DISPLAY") or 20)
+NAVER_PAGES = int(os.getenv("NAVER_PAGES") or 5)
 
-# Slack 전송 간 간격 (초). 채널 rate limit 보호용
-SLACK_SEND_INTERVAL = float(os.getenv("SLACK_SEND_INTERVAL", "0.5"))
+# Slack 전송 간 간격 (초). Incoming Webhook 권고치(~1 msg/sec) 준수
+SLACK_SEND_INTERVAL = float(os.getenv("SLACK_SEND_INTERVAL") or 1.0)
 
 # 제목에 반드시 포함되어야 하는 키워드
 TITLE_ONLY_KEYWORDS = {"카카오", "김범수"}
@@ -65,7 +66,6 @@ SOURCE_NAME_MAP = {
     "mk.co.kr": "매일경제",
     "hankyung.com": "한국경제",
     "news.naver.com": "네이버뉴스",
-    "n.news.naver.com": "네이버뉴스",
     "yna.co.kr": "연합뉴스",
     "yonhapnews.co.kr": "연합뉴스",
     "zdnet.co.kr": "ZDNet Korea",
@@ -451,10 +451,11 @@ def build_slack_payload(org: str, item: dict) -> dict:
         meta_parts.append(f"({source})")
     meta = " ".join(meta_parts)
 
-    # Slack mrkdwn: 링크 텍스트에 꺾쇠/파이프가 들어가면 안 됨
+    # Slack mrkdwn: 링크 텍스트/URL 모두 꺾쇠·파이프 금지
     safe_title = title.replace("<", "‹").replace(">", "›").replace("|", "｜")
+    safe_link = link.replace(">", "%3E").replace("|", "%7C")
 
-    header = f"*<{link}|[{org}] {safe_title}>*"
+    header = f"*<{safe_link}|[{org}] {safe_title}>*"
     if meta:
         header = f"{header} {meta}"
 
