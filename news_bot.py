@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from collections import defaultdict
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 KST = timezone(timedelta(hours=9))
 
-KAKAOWORK_WEBHOOK_URL = os.getenv("KAKAOWORK_WEBHOOK_URL", "").strip()
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 SHEET_GID = os.getenv("SHEET_GID", "0").strip()
 
@@ -39,17 +40,58 @@ MAX_ARTICLES_PER_ORG = int(os.getenv("MAX_ARTICLES_PER_ORG", "3"))
 NAVER_DISPLAY = int(os.getenv("NAVER_DISPLAY", "20"))
 NAVER_PAGES = int(os.getenv("NAVER_PAGES", "5"))
 
-# 제목에 반드시 포함되어야 하는 키워드 (항상 제목 필수, MUST 여부 무관)
+# Slack 전송 간 간격 (초). 채널 rate limit 보호용
+SLACK_SEND_INTERVAL = float(os.getenv("SLACK_SEND_INTERVAL", "0.5"))
+
+# 제목에 반드시 포함되어야 하는 키워드
 TITLE_ONLY_KEYWORDS = {"카카오", "김범수"}
 
-# 기사 수 제한 없는 조직 (MAX_ARTICLES_PER_ORG 무시)
+# 기사 수 제한 없는 조직
 UNCAPPED_ORGS = {"카카오", "김범수", "브라이언임팩트", "카카오임팩트"}
 
-# 짧은 키워드 판단 기준 (한글 3글자 이하, 영문 5자 이하)
-# 짧은 키워드는 기본적으로 제목 필수이지만,
-# MUST_ALL 또는 MUST_ANY가 있으면 요약 매칭도 허용
+# 짧은 키워드 기준
 SHORT_KW_KR = 3
 SHORT_KW_EN = 5
+
+
+# ──────────────────────────────────────────────
+# 출처(언론사) 매핑
+# ──────────────────────────────────────────────
+SOURCE_NAME_MAP = {
+    "chosun.com": "조선일보",
+    "donga.com": "동아일보",
+    "hani.co.kr": "한겨레",
+    "joongang.co.kr": "중앙일보",
+    "mk.co.kr": "매일경제",
+    "hankyung.com": "한국경제",
+    "news.naver.com": "네이버뉴스",
+    "n.news.naver.com": "네이버뉴스",
+    "yna.co.kr": "연합뉴스",
+    "yonhapnews.co.kr": "연합뉴스",
+    "zdnet.co.kr": "ZDNet Korea",
+    "etnews.com": "전자신문",
+    "bloter.net": "블로터",
+    "mt.co.kr": "머니투데이",
+    "edaily.co.kr": "이데일리",
+    "sedaily.com": "서울경제",
+    "kmib.co.kr": "국민일보",
+    "khan.co.kr": "경향신문",
+    "mbc.co.kr": "MBC",
+    "kbs.co.kr": "KBS",
+    "sbs.co.kr": "SBS",
+    "ytn.co.kr": "YTN",
+    "jtbc.co.kr": "JTBC",
+    "news1.kr": "뉴스1",
+    "newsis.com": "뉴시스",
+    "hankookilbo.com": "한국일보",
+    "fnnews.com": "파이낸셜뉴스",
+    "mbn.co.kr": "MBN",
+    "businesspost.co.kr": "비즈니스포스트",
+    "techm.kr": "테크M",
+    "ddaily.co.kr": "디지털데일리",
+    "dt.co.kr": "디지털타임스",
+    "inews24.com": "아이뉴스24",
+}
 
 
 # ──────────────────────────────────────────────
@@ -104,10 +146,7 @@ def parse_csv_list(value):
 
 
 def parse_keywords(query_str):
-    """
-    검색어 필드에서 or로 구분된 개별 키워드를 추출.
-    예: '"브라이언임팩트" or "브라이언 임팩트"' → ['브라이언임팩트', '브라이언 임팩트']
-    """
+    """검색어 필드에서 or로 구분된 개별 키워드를 추출."""
     parts = re.split(r"\bor\b", query_str, flags=re.IGNORECASE)
     keywords = []
     for p in parts:
@@ -116,6 +155,26 @@ def parse_keywords(query_str):
             keywords.append(cleaned)
     return keywords
 
+
+def extract_source(link: str) -> str:
+    """URL에서 출처(언론사)명 추출. 매핑에 없으면 도메인 그대로."""
+    if not link:
+        return ""
+    try:
+        host = urlparse(link).netloc.lower()
+        for prefix in ("www.", "m.", "news."):
+            if host.startswith(prefix):
+                host = host[len(prefix):]
+                break
+        for domain, name in SOURCE_NAME_MAP.items():
+            if host == domain or host.endswith("." + domain):
+                return name
+        parts = host.split(".")
+        if len(parts) >= 2:
+            return ".".join(parts[-2:])
+        return host
+    except Exception:
+        return ""
 
 
 # ──────────────────────────────────────────────
@@ -131,20 +190,11 @@ def is_short_keyword(kw):
 
 def keyword_match(keywords, title, summary, has_must_filter):
     """
-    검색 키워드와 기사의 관련성을 확인.
-
-    매칭 규칙 (키워드별로 판단, 하나라도 매칭되면 통과):
-
-    1) TITLE_ONLY_KEYWORDS ("카카오", "김범수"):
-       → 항상 제목 필수. MUST 필터 유무와 무관.
-
-    2) 짧은 키워드 (한글 3글자-, 영문 5자-):
-       → MUST_ALL 또는 MUST_ANY 필터가 있으면: 제목 또는 요약
-       → 필터가 없으면: 제목 필수
-       (필터가 노이즈를 걸러주므로 요약 매칭 허용)
-
-    3) 긴 키워드 (한글 4글자+, 영문 6자+):
-       → 항상 제목 또는 요약
+    매칭 규칙:
+    1) TITLE_ONLY_KEYWORDS → 항상 제목 필수
+    2) 짧은 키워드 + MUST 필터 있음 → 제목 또는 요약
+       짧은 키워드 + MUST 필터 없음 → 제목 필수
+    3) 긴 키워드 → 제목 또는 요약
     """
     title_lower = title.lower()
     summary_lower = summary.lower()
@@ -152,22 +202,18 @@ def keyword_match(keywords, title, summary, has_must_filter):
     for kw in keywords:
         kw_lower = kw.lower()
 
-        # 1) TITLE_ONLY: 항상 제목 필수
         if kw in TITLE_ONLY_KEYWORDS:
             if kw_lower in title_lower:
                 return True
             continue
 
-        # 2) 짧은 키워드
         if is_short_keyword(kw):
             if kw_lower in title_lower:
                 return True
-            # MUST 필터가 있으면 요약도 허용
             if has_must_filter and kw_lower in summary_lower:
                 return True
             continue
 
-        # 3) 긴 키워드: 제목 또는 요약
         if kw_lower in title_lower or kw_lower in summary_lower:
             return True
 
@@ -175,38 +221,23 @@ def keyword_match(keywords, title, summary, has_must_filter):
 
 
 def relevance_pass(title, summary, keywords, must_all, must_any, block):
-    """
-    필터링 파이프라인:
-
-    1) 키워드 매칭:
-       - TITLE_ONLY 키워드 → 항상 제목 필수
-       - 짧은 키워드 + MUST 필터 없음 → 제목 필수
-       - 짧은 키워드 + MUST 필터 있음 → 제목/요약
-       - 긴 키워드 → 항상 제목/요약
-    2) BLOCK:    하나라도 포함되면 제외
-    3) MUST_ALL: 모든 키워드가 포함되어야 통과
-    4) MUST_ANY: 하나 이상 포함되어야 통과
-    """
+    """키워드 매칭 → BLOCK → MUST_ALL → MUST_ANY 순으로 필터링."""
     has_must_filter = bool(must_all or must_any)
 
-    # 1) 키워드 매칭
     if not keyword_match(keywords, title, summary, has_must_filter):
         return False
 
     text = (title + " " + summary).lower()
 
-    # 2) BLOCK 체크
     for b in block:
         if b.lower() in text:
             return False
 
-    # 3) MUST_ALL 체크
     if must_all:
         for m in must_all:
             if m.lower() not in text:
                 return False
 
-    # 4) MUST_ANY 체크
     if must_any:
         if not any(m.lower() in text for m in must_any):
             return False
@@ -300,10 +331,7 @@ def search_naver(query):
 # NewsAPI.org 검색
 # ──────────────────────────────────────────────
 def search_newsapi(query, start_dt, end_dt):
-    """
-    NewsAPI.org /v2/everything 엔드포인트로 검색.
-    NEWSAPI_KEY 환경변수가 없으면 빈 리스트 반환 (옵션 기능).
-    """
+    """NewsAPI.org /v2/everything 엔드포인트로 검색."""
     if not NEWSAPI_KEY:
         return []
 
@@ -360,11 +388,7 @@ def search_newsapi(query, start_dt, end_dt):
 # 통합 검색
 # ──────────────────────────────────────────────
 def search_all_keywords(keywords, start_dt, end_dt):
-    """
-    여러 키워드(or로 분리된)를 각각 네이버에서 검색하고,
-    NewsAPI에는 OR 연결 전체 쿼리를 한 번 보낸 뒤 결과를 합침.
-    링크 기준으로 중복 제거.
-    """
+    """네이버 + NewsAPI 통합 검색, 링크 기준 중복 제거."""
     seen_links = set()
     results = []
 
@@ -373,12 +397,10 @@ def search_all_keywords(keywords, start_dt, end_dt):
             seen_links.add(item["link"])
             results.append(item)
 
-    # 네이버: 키워드별 개별 검색 (OR 미지원)
     for kw in keywords:
         for item in search_naver(kw):
             _add(item)
 
-    # NewsAPI: OR 연결 전체 쿼리 한 번 검색
     if NEWSAPI_KEY and keywords:
         newsapi_query = " OR ".join(f'"{kw}"' for kw in keywords)
         for item in search_newsapi(newsapi_query, start_dt, end_dt):
@@ -411,38 +433,64 @@ def get_delivery_window():
 
 
 # ──────────────────────────────────────────────
-# 메시지 작성 & 발송
+# Slack 메시지 작성 & 발송
 # ──────────────────────────────────────────────
-def build_message(org, items):
-    """카카오워크로 보낼 텍스트 메시지 생성."""
-    lines = [f"📰 {org}", ""]
+def build_slack_payload(org: str, item: dict) -> dict:
+    """기사 1건을 Slack Block Kit 메시지로 변환."""
+    title = item["title"]
+    link = item["link"]
+    summary = item.get("summary", "") or ""
+    dt = item.get("published_at")
+    time_str = dt.strftime("%m-%d %H:%M") if dt else ""
+    source = extract_source(link)
 
-    for it in items:
-        t = it["title"]
-        l = it["link"]
-        dt = it["published_at"]
-        time_str = dt.strftime("%m-%d %H:%M") if dt else ""
+    meta_parts = []
+    if time_str:
+        meta_parts.append(f"({time_str})")
+    if source:
+        meta_parts.append(f"({source})")
+    meta = " ".join(meta_parts)
 
-        lines.append(f"- {t}")
-        lines.append(f"  ({time_str})")
-        lines.append(f"  {l}")
-        lines.append("")
+    # Slack mrkdwn: 링크 텍스트에 꺾쇠/파이프가 들어가면 안 됨
+    safe_title = title.replace("<", "‹").replace(">", "›").replace("|", "｜")
 
-    lines.append(f"총 {len(items)}건")
-    return "\n".join(lines)
+    header = f"*<{link}|[{org}] {safe_title}>*"
+    if meta:
+        header = f"{header} {meta}"
+
+    clean_summary = re.sub(r"\s+", " ", summary).strip()
+    if len(clean_summary) > 240:
+        clean_summary = clean_summary[:237] + "…"
+
+    body = header
+    if clean_summary:
+        body += f"\n{clean_summary}"
+
+    return {
+        "blocks": [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": body},
+            }
+        ],
+        "text": f"[{org}] {title}",
+        "unfurl_links": False,
+        "unfurl_media": False,
+    }
 
 
-def send_kakaowork(text):
-    """카카오워크 웹훅으로 메시지 전송."""
+def send_slack(payload: dict) -> bool:
+    """Slack Incoming Webhook 전송. 성공 여부 반환."""
+    if not SLACK_WEBHOOK_URL:
+        logger.error("SLACK_WEBHOOK_URL이 설정되지 않았습니다.")
+        return False
     try:
-        r = requests.post(
-            KAKAOWORK_WEBHOOK_URL,
-            json={"text": text},
-            timeout=20,
-        )
+        r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=20)
         r.raise_for_status()
+        return True
     except requests.RequestException as e:
-        logger.error(f"카카오워크 전송 실패: {e}")
+        logger.error(f"Slack 전송 실패: {e}")
+        return False
 
 
 # ──────────────────────────────────────────────
@@ -463,7 +511,7 @@ def main():
 
     df = load_sheet()
 
-    # ── 1단계: 조직별로 행을 묶어서 검색 & 필터링 ──
+    # ── 1단계: 조직별 검색 & 필터링 ──
     org_results = defaultdict(list)
 
     for _, row in df.iterrows():
@@ -473,12 +521,10 @@ def main():
         if not org or not query:
             continue
 
-        # 시트 필터링 컬럼 파싱
         must_all = parse_csv_list(row.get("MUST_ALL"))
         must_any = parse_csv_list(row.get("MUST_ANY"))
         block = parse_csv_list(row.get("BLOCK"))
 
-        # or로 구분된 키워드 전체 검색 (네이버 + NewsAPI)
         keywords = parse_keywords(query)
         if not keywords:
             continue
@@ -490,36 +536,31 @@ def main():
             summary = item["summary"]
             pub = item["published_at"]
 
-            # 시간 범위 필터
             if not pub:
                 continue
             if not (start_dt <= pub <= end_dt):
                 continue
 
-            # 키워드 매칭 + MUST_ALL / MUST_ANY / BLOCK 필터
             if not relevance_pass(title, summary, keywords, must_all, must_any, block):
                 continue
 
             org_results[org].append(item)
 
-    # ── 2단계: 조직별 중복 제거, 정렬, 발송 ──
-    sent_count = 0
+    # ── 2단계: 조직별 중복 제거, 정렬, 기사 1개씩 발송 ──
+    total_sent = 0
 
     for org, items in org_results.items():
-        # 링크 기준 중복 제거
         deduped = {}
         for it in items:
             if it["link"] not in deduped:
                 deduped[it["link"]] = it
 
-        # 최신순 정렬
         sorted_items = sorted(
             deduped.values(),
             key=lambda x: x["published_at"] or datetime.min.replace(tzinfo=KST),
             reverse=True,
         )
 
-        # 조직별 기사 수 제한 (UNCAPPED_ORGS는 무제한)
         if org in UNCAPPED_ORGS:
             final = sorted_items
         else:
@@ -528,12 +569,17 @@ def main():
         if not final:
             continue
 
-        msg = build_message(org, final)
-        send_kakaowork(msg)
-        sent_count += 1
-        logger.info(f"✅ {org}: {len(final)}건 전송 완료")
+        org_sent = 0
+        for it in final:
+            payload = build_slack_payload(org, it)
+            if send_slack(payload):
+                org_sent += 1
+                total_sent += 1
+            time.sleep(SLACK_SEND_INTERVAL)
 
-    logger.info(f"총 {sent_count}개 조직 발송 완료")
+        logger.info(f"✅ {org}: {org_sent}/{len(final)}건 전송 완료")
+
+    logger.info(f"총 {total_sent}건 발송 완료")
 
 
 if __name__ == "__main__":
