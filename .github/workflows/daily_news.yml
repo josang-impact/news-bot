@@ -1,4 +1,4 @@
-name: Daily Org News to KakaoWork
+name: Daily Org News to Slack
 
 on:
   schedule:
@@ -23,7 +23,7 @@ jobs:
 
       - name: Run bot
         env:
-          KAKAOWORK_WEBHOOK_URL: ${{ secrets.KAKAOWORK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           SHEET_GID: ${{ secrets.SHEET_GID }}
           MAX_ARTICLES_PER_ORG: ${{ secrets.MAX_ARTICLES_PER_ORG }}
