@@ -6,7 +6,7 @@ Google News RSS를 검색한 뒤,
 
 ## Required GitHub Secrets
 
-- KAKAOWORK_WEBHOOK_URL
+- SLACK_WEBHOOK_URL
 - SHEET_ID
 - SHEET_GID
 
