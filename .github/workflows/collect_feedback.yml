@@ -1,0 +1,32 @@
+name: Collect Slack Feedback
+
+on:
+  schedule:
+    # 매일 저녁 20:00 KST = 11:00 UTC
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+
+jobs:
+  collect-feedback:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect feedback
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
+          SHEET_WEBHOOK_TOKEN: ${{ secrets.SHEET_WEBHOOK_TOKEN }}
+          FEEDBACK_LOOKBACK_DAYS: ${{ secrets.FEEDBACK_LOOKBACK_DAYS }}
+        run: python collect_feedback.py
