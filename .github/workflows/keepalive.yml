@@ -1,0 +1,25 @@
+name: Keepalive
+
+# 레포에 60일간 활동이 없으면 GitHub이 schedule 워크플로우를 자동 비활성화한다.
+# 매달 1일 빈 커밋을 푸시해 비활성화 타이머를 리셋한다.
+on:
+  schedule:
+    - cron: "17 4 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Push empty keepalive commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive [skip ci]"
+          git push
