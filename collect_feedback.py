@@ -34,6 +34,12 @@ SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID", "").strip()
 SHEET_WEBHOOK_URL = os.getenv("SHEET_WEBHOOK_URL", "").strip()
 SHEET_WEBHOOK_TOKEN = os.getenv("SHEET_WEBHOOK_TOKEN", "").strip()
 
+# Apps Script 웹앱은 요청을 googleusercontent.com/macros/echo 로 리다이렉트하는데,
+# 이 엔드포인트가 간헐적으로 404/5xx를 반환한다(2026-08 기준 100회 중 3회).
+# 웹훅 op(upsert_feedback / replace_tab)는 모두 멱등이라 재시도해도 시트가 중복되지 않는다.
+WEBHOOK_MAX_ATTEMPTS = int(os.getenv("WEBHOOK_MAX_ATTEMPTS") or 4)
+WEBHOOK_RETRY_STATUSES = {404, 408, 429, 500, 502, 503, 504}
+
 LOOKBACK_DAYS = int(os.getenv("FEEDBACK_LOOKBACK_DAYS") or 3)
 BLOCK_MIN_COUNT = int(os.getenv("BLOCK_MIN_COUNT") or 2)
 BLOCK_TOP_N = int(os.getenv("BLOCK_TOP_N") or 15)
@@ -178,12 +184,36 @@ def post_to_sheet(payload):
         raise RuntimeError("SHEET_WEBHOOK_URL / SHEET_WEBHOOK_TOKEN가 설정되지 않았습니다.")
 
     body = {"token": SHEET_WEBHOOK_TOKEN, **payload}
-    r = requests.post(SHEET_WEBHOOK_URL, json=body, timeout=60)
-    r.raise_for_status()
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"웹훅 에러: {data.get('error')}")
-    return data
+    last_error = None
+
+    for attempt in range(1, WEBHOOK_MAX_ATTEMPTS + 1):
+        try:
+            r = requests.post(SHEET_WEBHOOK_URL, json=body, timeout=60)
+            if r.status_code in WEBHOOK_RETRY_STATUSES:
+                raise requests.HTTPError(f"{r.status_code} 응답", response=r)
+            if r.status_code >= 400:
+                # 인증 실패 같은 영구 오류는 재시도해도 결과가 같으므로 즉시 중단한다.
+                raise RuntimeError(f"웹훅 HTTP {r.status_code} (재시도 대상 아님)")
+            data = r.json()
+            if not data.get("ok"):
+                # 웹훅이 정상 응답한 논리 오류(unauthorized 등)는 재시도해도 결과가 같다.
+                raise RuntimeError(f"웹훅 에러: {data.get('error')}")
+            if attempt > 1:
+                logger.info(f"웹훅 재시도 {attempt}회차에 성공했습니다.")
+            return data
+        except (requests.RequestException, ValueError) as e:
+            last_error = e
+            if attempt == WEBHOOK_MAX_ATTEMPTS:
+                break
+            wait = 2 ** (attempt - 1)
+            logger.warning(
+                f"웹훅 호출 실패 ({attempt}/{WEBHOOK_MAX_ATTEMPTS}): {e} → {wait}초 후 재시도"
+            )
+            time.sleep(wait)
+
+    raise RuntimeError(
+        f"웹훅 호출이 {WEBHOOK_MAX_ATTEMPTS}회 모두 실패했습니다: {last_error}"
+    )
 
 
 def upsert_feedback(records):
