@@ -5,6 +5,16 @@ on:
     - cron: "0 23 * * 0-4"
   workflow_dispatch:
 
+# 발송 이력 파일을 리포에 다시 커밋한다.
+permissions:
+  contents: write
+
+# 수동 실행과 지연된 예약 실행이 겹치지 않도록 직렬화한다.
+# 뒤에 온 실행은 앞 실행이 이력을 커밋한 뒤에 체크아웃하므로 중복을 걸러낸다.
+concurrency:
+  group: daily-news
+  cancel-in-progress: false
+
 jobs:
   run-news-bot:
     runs-on: ubuntu-latest
@@ -30,3 +40,25 @@ jobs:
           NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
         run: python news_bot.py
+
+      # 발송 도중 실패해도 그때까지 보낸 기록은 남겨야 하므로 always() 로 실행한다.
+      - name: Commit sent-link state
+        if: always()
+        run: |
+          if [ -z "$(git status --porcelain state/sent_links.json)" ]; then
+            echo "발송 이력에 변경이 없습니다."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/sent_links.json
+          git commit -m "chore: 발송 이력 갱신 [skip ci]"
+          for attempt in 1 2 3; do
+            if git pull --rebase --autostash && git push; then
+              exit 0
+            fi
+            echo "push 실패, 재시도 ${attempt}/3"
+            sleep 5
+          done
+          echo "::error::발송 이력 커밋에 실패했습니다. 다음 실행에서 중복 발송이 발생할 수 있습니다."
+          exit 1
