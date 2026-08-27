@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import html
 import time
 import logging
@@ -43,6 +44,11 @@ NAVER_PAGES = int(os.getenv("NAVER_PAGES") or 5)
 
 # Slack 전송 간 간격 (초). Incoming Webhook 권고치(~1 msg/sec) 준수
 SLACK_SEND_INTERVAL = float(os.getenv("SLACK_SEND_INTERVAL") or 1.0)
+
+# 발송 이력 파일. 이미 보낸 기사 링크를 날짜별로 기록해 중복 발송을 막는다.
+# GitHub Actions가 매 실행 후 이 파일을 리포에 커밋한다.
+SENT_STATE_PATH = os.getenv("SENT_STATE_PATH") or "state/sent_links.json"
+SENT_RETENTION_DAYS = int(os.getenv("SENT_RETENTION_DAYS") or 14)
 
 # 제목에 반드시 포함되어야 하는 키워드
 TITLE_ONLY_KEYWORDS = {"카카오", "김범수"}
@@ -480,6 +486,44 @@ def build_slack_payload(org: str, item: dict) -> dict:
     }
 
 
+# ──────────────────────────────────────────────
+# 발송 이력 (중복 발송 방지)
+# ──────────────────────────────────────────────
+def load_sent_state():
+    """발송 이력을 {날짜: [링크]} 로 읽어 오래된 항목을 정리해 반환한다.
+
+    파일이 없으면 첫 실행으로 보고 빈 이력으로 시작한다.
+    파일이 깨져 있으면 중단한다 — 빈 이력으로 진행하면 전량 재발송이 되기 때문이다.
+    """
+    if not os.path.exists(SENT_STATE_PATH):
+        logger.info(f"발송 이력 파일이 없습니다. 새로 시작합니다: {SENT_STATE_PATH}")
+        return {}
+
+    with open(SENT_STATE_PATH, encoding="utf-8") as f:
+        try:
+            raw = json.load(f)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"발송 이력 파일이 손상됐습니다 ({SENT_STATE_PATH}): {e}. "
+                "빈 이력으로 진행하면 기사를 전부 다시 보내게 되므로 중단합니다."
+            ) from e
+
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"발송 이력 파일 형식이 올바르지 않습니다: {SENT_STATE_PATH}")
+
+    cutoff = (datetime.now(KST) - timedelta(days=SENT_RETENTION_DAYS)).strftime("%Y-%m-%d")
+    return {d: list(links) for d, links in raw.items() if d >= cutoff}
+
+
+def save_sent_state(state):
+    directory = os.path.dirname(SENT_STATE_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(SENT_STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+
+
 def send_slack(payload: dict) -> bool:
     """Slack Incoming Webhook 전송. 성공 여부 반환."""
     if not SLACK_WEBHOOK_URL:
@@ -509,6 +553,13 @@ def main():
         logger.info("NewsAPI.org 활성화됨")
     else:
         logger.info("NewsAPI.org 비활성화 (NEWSAPI_KEY 미설정)")
+
+    sent_state = load_sent_state()
+    already_sent = {link for links in sent_state.values() for link in links}
+    logger.info(f"발송 이력 {len(already_sent)}건 로드 (최근 {SENT_RETENTION_DAYS}일)")
+
+    today_key = datetime.now(KST).strftime("%Y-%m-%d")
+    sent_state.setdefault(today_key, [])
 
     df = load_sheet()
 
@@ -549,6 +600,7 @@ def main():
 
     # ── 2단계: 조직별 중복 제거, 정렬, 기사 1개씩 발송 ──
     total_sent = 0
+    total_skipped = 0
 
     for org, items in org_results.items():
         deduped = {}
@@ -570,17 +622,34 @@ def main():
         if not final:
             continue
 
+        # 발송 대상 선정이 끝난 뒤에 이력을 대조한다. 선정 전에 걸러내면
+        # 재실행 시 한도(MAX_ARTICLES_PER_ORG)가 남아 다음 순위 기사가
+        # 새로 나가버린다.
+        unsent = [it for it in final if it["link"] not in already_sent]
+        skipped = len(final) - len(unsent)
+        total_skipped += skipped
+
+        if not unsent:
+            logger.info(f"⏭️  {org}: {skipped}건 모두 발송 이력에 있어 건너뜁니다.")
+            continue
+
         org_sent = 0
-        for it in final:
+        for it in unsent:
             payload = build_slack_payload(org, it)
             if send_slack(payload):
                 org_sent += 1
                 total_sent += 1
+                already_sent.add(it["link"])
+                sent_state[today_key].append(it["link"])
+                # 매 건마다 기록한다. 중간에 실패해도 보낸 것까지는 남는다.
+                save_sent_state(sent_state)
             time.sleep(SLACK_SEND_INTERVAL)
 
-        logger.info(f"✅ {org}: {org_sent}/{len(final)}건 전송 완료")
+        suffix = f" (이력 중복 {skipped}건 제외)" if skipped else ""
+        logger.info(f"✅ {org}: {org_sent}/{len(unsent)}건 전송 완료{suffix}")
 
-    logger.info(f"총 {total_sent}건 발송 완료")
+    save_sent_state(sent_state)
+    logger.info(f"총 {total_sent}건 발송 완료 (이력 중복으로 건너뛴 기사 {total_skipped}건)")
 
 
 if __name__ == "__main__":
