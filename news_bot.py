@@ -48,7 +48,11 @@ SLACK_SEND_INTERVAL = float(os.getenv("SLACK_SEND_INTERVAL") or 1.0)
 TITLE_ONLY_KEYWORDS = {"카카오", "김범수"}
 
 # 기사 수 제한 없는 조직
-UNCAPPED_ORGS = {"카카오", "김범수", "브라이언임팩트", "카카오임팩트"}
+UNCAPPED_ORGS = {
+    "카카오", "김범수", "브라이언임팩트", "카카오임팩트",
+    "테크포임팩트", "임팩트클라이밋", "AI_TOP_100",
+    "사이좋은 디지털 세상", "찾아가는 시니어 디지털 스쿨",
+}
 
 # 짧은 키워드 기준
 SHORT_KW_KR = 3
