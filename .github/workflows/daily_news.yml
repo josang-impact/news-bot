@@ -3,25 +3,50 @@ name: Daily Org News to Slack
 on:
   schedule:
     - cron: "0 23 * * 0-4"
-  workflow_dispatch:
+  workflow_dispatch:  # 맥 launchd가 평일 08:00에 호출 (위 schedule은 맥이 꺼진 날 대비 예비)
+
+permissions:
+  contents: read
+  actions: read
+
+# 맥 호출과 예약 실행이 겹치면 뒤 실행은 앞 실행이 끝날 때까지 기다린다
+concurrency:
+  group: daily-news
+  cancel-in-progress: false
 
 jobs:
   run-news-bot:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Skip if already sent today
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          today=$(TZ=Asia/Seoul date +%Y-%m-%d)
+          sent=$(gh run list -R "$GITHUB_REPOSITORY" --workflow daily_news.yml --status success -L 20 \
+            --json databaseId,createdAt \
+            --jq "[.[] | select(.databaseId != ${{ github.run_id }}) | select((.createdAt | fromdateiso8601 + 32400 | strftime(\"%Y-%m-%d\")) == \"$today\")] | length")
+          echo "sent=$sent" >> "$GITHUB_OUTPUT"
+          [ "$sent" = "0" ] || echo "오늘($today) 이미 발송됨 — 건너뜀"
+
       - name: Checkout repository
+        if: steps.guard.outputs.sent == '0'
         uses: actions/checkout@v4
 
       - name: Set up Python
+        if: steps.guard.outputs.sent == '0'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
+        if: steps.guard.outputs.sent == '0'
         run: pip install -r requirements.txt
 
       - name: Run bot
+        if: steps.guard.outputs.sent == '0'
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SHEET_ID: ${{ secrets.SHEET_ID }}

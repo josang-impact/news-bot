@@ -35,7 +35,10 @@ Google Sheet에 정의된 조직별 키워드로 네이버 뉴스 API(옵션: Ne
 
 ## 스케줄
 
-`.github/workflows/daily_news.yml` 기준 평일 08:00 KST (`0 23 * * 0-4` UTC)에 실행되며,
+GitHub 예약 실행(cron)은 몇 시간씩 밀리므로, 맥 launchd(`com.sophie.newsbot-trigger`)가 평일 08:00에
+`scripts/trigger_daily_news.sh`로 `gh workflow run`을 호출합니다(로그: `logs/trigger.log`).
+`.github/workflows/daily_news.yml`의 cron(`0 23 * * 0-4` UTC)은 맥이 꺼진 날 대비 예비이고,
+워크플로 첫 단계가 오늘(KST) 성공한 실행이 있으면 건너뛰어 중복 발송을 막습니다.
 수동 실행은 GitHub Actions의 **Run workflow** 버튼으로 가능합니다.
 
 ---
