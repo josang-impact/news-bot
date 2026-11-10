@@ -6,6 +6,8 @@
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 REPO="josang-impact/news-bot"
+# gh에 계정이 여럿이라도 실행 권한이 있는 저장소 소유 계정으로 고정한다
+export GH_TOKEN="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token -u josang-impact 2>/dev/null)"
 LOG="/Users/sophie.impact/Documents/_Workspace/92_인프라도구/newsbot/logs/trigger.log"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 
